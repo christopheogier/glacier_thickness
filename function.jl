@@ -297,6 +297,299 @@ function _finite_raster_maximum(raster)
     return maximum(values)
 end
 
+"""
+    profile_dem_values(dem_path, profile_paths; output_dir, source_epsg=nothing, uncertainty_minus_path=nothing, uncertainty_plus_path=nothing, surface_path=nothing)
+
+Sample `dem_path` along one or more profile files and write one CSV per profile.
+Supported profile inputs are KML LineString files, CSV files with x/y or lon/lat
+columns, and OGR-readable line vector files such as shapefiles. Profiles are
+reprojected to the DEM CRS when needed and densified at the DEM pixel spacing.
+"""
+function profile_dem_values(
+    dem_path,
+    profile_paths;
+    output_dir=joinpath(@__DIR__, "output", "profiles"),
+    source_epsg=nothing,
+    force=true,
+    uncertainty_minus_path=nothing,
+    uncertainty_plus_path=nothing,
+    surface_path=nothing,
+)
+    paths = profile_paths isa AbstractString ? [profile_paths] : collect(profile_paths)
+    isempty(paths) && error("No profile files were provided.")
+
+    (uncertainty_minus_path === nothing) == (uncertainty_plus_path === nothing) ||
+        error("uncertainty_minus_path and uncertainty_plus_path must be provided together.")
+
+    mkpath(output_dir)
+
+    return ArchGDAL.read(dem_path) do dataset
+        band = ArchGDAL.getband(dataset, 1)
+        array = Float64.(ArchGDAL.read(band))
+        nodata = ArchGDAL.getnodatavalue(band)
+        gt = ArchGDAL.getgeotransform(dataset)
+        dem_epsg = parse(Int, _target_epsg_code(dataset, gt))
+        resolution = _dem_spatial_resolution(gt)
+        uncertainty_minus = uncertainty_minus_path === nothing ? nothing : _read_sampling_raster(uncertainty_minus_path)
+        uncertainty_plus = uncertainty_plus_path === nothing ? nothing : _read_sampling_raster(uncertainty_plus_path)
+        surface = surface_path === nothing ? nothing : _read_sampling_raster(surface_path)
+        for sampling_raster in (uncertainty_minus, uncertainty_plus, surface)
+            sampling_raster !== nothing && sampling_raster.epsg != dem_epsg && error("Profile rasters must use the same EPSG as the bedrock DEM.")
+        end
+        has_uncertainty = uncertainty_minus !== nothing
+        has_surface = surface !== nothing
+
+        out_paths = String[]
+        for profile_path in paths
+            coordinates = _read_profile_coordinates(profile_path; source_epsg)
+            projected = _project_profile_to_dem(coordinates, dem_epsg)
+            sampled_xy = _densify_profile(projected, resolution)
+            output_path = joinpath(output_dir, splitext(basename(profile_path))[1] * "_" * splitext(basename(dem_path))[1] * ".csv")
+
+            if isfile(output_path) && !force
+                push!(out_paths, output_path)
+                continue
+            end
+
+            open(output_path, "w") do io
+                header = has_uncertainty || has_surface ? "x,y,z,z_lower,z_upper" : "x,y,z"
+                has_surface && (header *= ",surface_z,thickness")
+                println(io, header)
+                for (x, y) in sampled_xy
+                    z = _sample_raster_bilinear(array, gt, nodata, x, y)
+                    if has_uncertainty || has_surface
+                        z_lower = missing
+                        z_upper = missing
+                        if has_uncertainty
+                            lower_error = _sample_raster_bilinear(uncertainty_plus.array, uncertainty_plus.gt, uncertainty_plus.nodata, x, y)
+                            upper_error = _sample_raster_bilinear(uncertainty_minus.array, uncertainty_minus.gt, uncertainty_minus.nodata, x, y)
+                            z_lower = (z === missing || lower_error === missing) ? missing : z - lower_error
+                            z_upper = (z === missing || upper_error === missing) ? missing : z - upper_error
+                        end
+                        row = string(x, ",", y, ",", z === missing ? "" : z, ",", z_lower === missing ? "" : z_lower, ",", z_upper === missing ? "" : z_upper)
+                        if has_surface
+                            surface_z = _sample_raster_bilinear(surface.array, surface.gt, surface.nodata, x, y)
+                            thickness = (z === missing || surface_z === missing) ? missing : surface_z - z
+                            row *= string(",", surface_z === missing ? "" : surface_z, ",", thickness === missing ? "" : thickness)
+                        end
+                        println(io, row)
+                    else
+                        println(io, string(x, ",", y, ",", z === missing ? "" : z))
+                    end
+                end
+            end
+            push!(out_paths, output_path)
+        end
+
+        return out_paths
+    end
+end
+
+function _read_sampling_raster(path)
+    return ArchGDAL.read(path) do dataset
+        band = ArchGDAL.getband(dataset, 1)
+        gt = ArchGDAL.getgeotransform(dataset)
+        (
+            array=Float64.(ArchGDAL.read(band)),
+            nodata=ArchGDAL.getnodatavalue(band),
+            gt=gt,
+            epsg=parse(Int, _target_epsg_code(dataset, gt)),
+        )
+    end
+end
+
+function _read_profile_coordinates(path; source_epsg=nothing)
+    ext = lowercase(splitext(path)[2])
+    coordinates =
+        ext == ".kml" ? _read_kml_linestring_coordinates(path) :
+        ext == ".csv" ? _read_csv_profile_coordinates(path) :
+        _read_ogr_profile_coordinates(path)
+
+    epsg = source_epsg === nothing ? _guess_profile_epsg(coordinates) : source_epsg
+    return (; coordinates, epsg)
+end
+
+function _read_kml_linestring_coordinates(path)
+    text = read(path, String)
+    linestring_regex = Regex("<LineString\\b.*?</LineString>", "s")
+    coordinates_regex = Regex("<coordinates>(.*?)</coordinates>", "s")
+    coordinates = Tuple{Float64,Float64}[]
+
+    for linestring in eachmatch(linestring_regex, text)
+        coordinate_match = match(coordinates_regex, linestring.match)
+        coordinate_match === nothing && continue
+        append!(coordinates, _parse_coordinate_text(coordinate_match.captures[1]))
+    end
+
+    isempty(coordinates) && error("No LineString coordinates found in KML profile: $path")
+    return coordinates
+end
+
+function _read_csv_profile_coordinates(path)
+    rows = [strip(line) for line in readlines(path) if !isempty(strip(line))]
+    isempty(rows) && error("No coordinates found in CSV profile: $path")
+
+    delimiter_regex = r"[,;\s]+"
+    first_fields = split(rows[1], delimiter_regex; keepempty=false)
+    first_numbers = tryparse.(Float64, first_fields)
+    has_header = any(isnothing, first_numbers)
+
+    x_index, y_index = 1, 2
+    start_index = 1
+    if has_header
+        headers = lowercase.(strip.(first_fields))
+        x_candidates = findall(h -> h in ("x", "easting", "lon", "longitude"), headers)
+        y_candidates = findall(h -> h in ("y", "northing", "lat", "latitude"), headers)
+        (isempty(x_candidates) || isempty(y_candidates)) && error("CSV profile must have x/y, easting/northing, or lon/lat columns: $path")
+        x_index, y_index = first(x_candidates), first(y_candidates)
+        start_index = 2
+    end
+
+    coordinates = Tuple{Float64,Float64}[]
+    for line in rows[start_index:end]
+        fields = split(line, delimiter_regex; keepempty=false)
+        length(fields) >= max(x_index, y_index) || continue
+        x = parse(Float64, fields[x_index])
+        y = parse(Float64, fields[y_index])
+        push!(coordinates, (x, y))
+    end
+
+    length(coordinates) >= 2 || error("A profile needs at least two coordinates: $path")
+    return coordinates
+end
+
+function _read_ogr_profile_coordinates(path)
+    coordinates = Tuple{Float64,Float64}[]
+    ArchGDAL.read(path) do dataset
+        for layer_index in 0:(ArchGDAL.nlayer(dataset) - 1)
+            layer = ArchGDAL.getlayer(dataset, layer_index)
+            for feature in layer
+                geom = ArchGDAL.getgeom(feature)
+                append!(coordinates, _coordinates_from_wkt(ArchGDAL.toWKT(geom)))
+            end
+        end
+    end
+
+    length(coordinates) >= 2 || error("No line coordinates found in vector profile: $path")
+    return coordinates
+end
+
+function _parse_coordinate_text(text)
+    coordinates = Tuple{Float64,Float64}[]
+    for token in split(strip(text))
+        parts = split(strip(token), ",")
+        length(parts) >= 2 || continue
+        push!(coordinates, (parse(Float64, parts[1]), parse(Float64, parts[2])))
+    end
+    return coordinates
+end
+
+function _coordinates_from_wkt(wkt)
+    coordinates = Tuple{Float64,Float64}[]
+    number = "[-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?"
+    for coordinate_match in eachmatch(Regex(number * "\\s+" * number), wkt)
+        parts = split(coordinate_match.match)
+        push!(coordinates, (parse(Float64, parts[1]), parse(Float64, parts[2])))
+    end
+    return coordinates
+end
+
+function _guess_profile_epsg(coordinates)
+    all(abs(x) <= 180 && abs(y) <= 90 for (x, y) in coordinates) ? 4326 : nothing
+end
+
+function _project_profile_to_dem(profile, dem_epsg)
+    coordinates, source_epsg = profile.coordinates, profile.epsg
+    if source_epsg === nothing || Int(source_epsg) == dem_epsg
+        return coordinates
+    end
+
+    projected = Tuple{Float64,Float64}[]
+    ArchGDAL.importEPSG(Int(source_epsg); order=:trad) do source
+        ArchGDAL.importEPSG(dem_epsg; order=:trad) do target
+            ArchGDAL.createcoordtrans(source, target) do transform
+                for (x, y) in coordinates
+                    ArchGDAL.createpoint(x, y) do point
+                        ArchGDAL.transform!(point, transform)
+                        px, py, _ = ArchGDAL.getpoint(point, 0)
+                        push!(projected, (px, py))
+                    end
+                end
+            end
+        end
+    end
+    return projected
+end
+
+function _dem_spatial_resolution(gt)
+    x_resolution = hypot(gt[2], gt[5])
+    y_resolution = hypot(gt[3], gt[6])
+    candidates = filter(>(0), [x_resolution, y_resolution])
+    isempty(candidates) && error("Could not determine DEM spatial resolution.")
+    return minimum(candidates)
+end
+
+function _densify_profile(coordinates, spacing)
+    length(coordinates) >= 2 || error("A profile needs at least two coordinates.")
+
+    cumulative = zeros(Float64, length(coordinates))
+    for i in 2:length(coordinates)
+        cumulative[i] = cumulative[i - 1] + hypot(coordinates[i][1] - coordinates[i - 1][1], coordinates[i][2] - coordinates[i - 1][2])
+    end
+    total_length = cumulative[end]
+    total_length > 0 || error("Profile length is zero.")
+
+    distances = collect(0.0:spacing:total_length)
+    if isempty(distances) || distances[end] < total_length
+        push!(distances, total_length)
+    end
+
+    sampled = Tuple{Float64,Float64}[]
+    segment = 1
+    for distance in distances
+        while segment < length(cumulative) - 1 && distance > cumulative[segment + 1]
+            segment += 1
+        end
+        segment_length = cumulative[segment + 1] - cumulative[segment]
+        t = segment_length == 0 ? 0.0 : (distance - cumulative[segment]) / segment_length
+        x = coordinates[segment][1] + t * (coordinates[segment + 1][1] - coordinates[segment][1])
+        y = coordinates[segment][2] + t * (coordinates[segment + 1][2] - coordinates[segment][2])
+        push!(sampled, (x, y))
+    end
+    return sampled
+end
+
+function _sample_raster_bilinear(array, gt, nodata, x, y)
+    det = gt[2] * gt[6] - gt[3] * gt[5]
+    det == 0 && error("Raster geotransform is not invertible.")
+
+    pixel_x = (gt[6] * (x - gt[1]) - gt[3] * (y - gt[4])) / det
+    pixel_y = (-gt[5] * (x - gt[1]) + gt[2] * (y - gt[4])) / det
+    col = pixel_x + 0.5
+    row = pixel_y + 0.5
+
+    width, height = size(array)
+    if col < 1 || row < 1 || col > width || row > height
+        return missing
+    end
+
+    c0 = clamp(floor(Int, col), 1, width)
+    r0 = clamp(floor(Int, row), 1, height)
+    c1 = clamp(c0 + 1, 1, width)
+    r1 = clamp(r0 + 1, 1, height)
+    tx = col - c0
+    ty = row - r0
+
+    values = (array[c0, r0], array[c1, r0], array[c0, r1], array[c1, r1])
+    if any(v -> !isfinite(v) || (nodata !== nothing && isapprox(v, nodata)), values)
+        return missing
+    end
+
+    z0 = (1 - tx) * values[1] + tx * values[2]
+    z1 = (1 - tx) * values[3] + tx * values[4]
+    return (1 - ty) * z0 + ty * z1
+end
+
 function _default_data_dir_for_region(region)
     data_root = joinpath(dirname(@__DIR__), "data")
     region == "11" && return joinpath(data_root, "Aletsch")
@@ -733,4 +1026,187 @@ function plot_biafo_thickness_comparison_with_milan(
     mkpath(dirname(output_path))
     save(output_path, fig)
     return fig
+end
+
+"""
+    plot_profile_elevations(profile_csv_paths; output_path, labels=nothing)
+
+Plot one or more sampled DEM profile CSVs as elevation against distance along
+profile. Profiles are oriented west-to-east using their projected x coordinate,
+so the x-axis runs from West on the left to East on the right.
+"""
+function plot_profile_elevations(
+    profile_csv_paths;
+    output_path=joinpath(@__DIR__, "output", "plots", "profile_elevations.png"),
+    labels=nothing,
+)
+    paths = profile_csv_paths isa AbstractString ? [profile_csv_paths] : collect(profile_csv_paths)
+    isempty(paths) && error("No profile CSV files were provided.")
+    labels === nothing && (labels = splitext.(basename.(paths)) .|> first)
+    length(labels) == length(paths) || error("labels must have the same length as profile_csv_paths.")
+
+    fig = Figure(size=(900, 760))
+    ax = Axis(
+        fig[1, 1],
+        xlabel="Distance along profile, west to east (m)",
+        ylabel="Bedrock elevation (m)",
+    )
+    thickness_ax = Axis(
+        fig[2, 1],
+        xlabel="Distance along profile, west to east (m)",
+        ylabel="Ice thickness (m)",
+    )
+
+    max_distance = 0.0
+    max_thickness = 0.0
+
+    for (path, label) in zip(paths, labels)
+        x, y, z, z_lower, z_upper, thickness = _read_profile_sample_csv(path)
+        if x[end] < x[1]
+            reverse!(x)
+            reverse!(y)
+            reverse!(z)
+            z_lower !== nothing && reverse!(z_lower)
+            z_upper !== nothing && reverse!(z_upper)
+            thickness !== nothing && reverse!(thickness)
+        end
+
+        distance = _profile_distances(x, y)
+        max_distance = max(max_distance, distance[end])
+        if z_lower !== nothing && z_upper !== nothing
+            bound_finite = findall(i -> z_lower[i] !== missing && z_upper[i] !== missing && isfinite(z_lower[i]) && isfinite(z_upper[i]), eachindex(z))
+            band!(ax, distance[bound_finite], Float64.(z_lower[bound_finite]), Float64.(z_upper[bound_finite]); color=(:gray, 0.22))
+        end
+        finite = findall(value -> value !== missing && isfinite(value), z)
+        lines!(ax, distance[finite], Float64.(z[finite]); label=label, linewidth=2.5)
+        if thickness !== nothing
+            thickness_finite = findall(value -> value !== missing && isfinite(value), thickness)
+            thickness_values = Float64.(thickness[thickness_finite])
+            !isempty(thickness_values) && (max_thickness = max(max_thickness, maximum(thickness_values)))
+            lines!(thickness_ax, distance[thickness_finite], thickness_values; label=label, linewidth=2.5)
+        end
+    end
+
+    text!(ax, 0.0, 1.03; text="West", space=:relative, align=(:left, :bottom), fontsize=13)
+    text!(ax, 1.0, 1.03; text="East", space=:relative, align=(:right, :bottom), fontsize=13)
+    xlims!(ax, 0, max_distance)
+    xlims!(thickness_ax, 0, max_distance)
+    max_thickness > 0 && ylims!(thickness_ax, max_thickness, 0)
+    axislegend(ax; position=:rt)
+    axislegend(thickness_ax; position=:rt)
+
+    mkpath(dirname(output_path))
+    save(output_path, fig)
+    return fig
+end
+
+function plot_biafo_thickness_profiles(
+    profile_csv_groups;
+    output_path=joinpath(@__DIR__, "output", "plots", "biafo_thickness_profiles.png"),
+    profile_labels=["Profile A", "Profile B", "Profile C"],
+    model_labels=["Consensus 2019", "Milan 2022", "Frank 2026"],
+    hewitt_points=nothing,
+    xerr=250,
+)
+    model_groups = [collect(group) for group in profile_csv_groups]
+    isempty(model_groups) && error("No profile CSV groups were provided.")
+    nprofiles = length(model_groups[1])
+    all(length(group) == nprofiles for group in model_groups) || error("Each model must provide the same number of profile CSVs.")
+    length(model_labels) == length(model_groups) || error("model_labels must match the number of CSV groups.")
+    length(profile_labels) == nprofiles || error("profile_labels must match the number of profiles.")
+
+    fig = Figure(size=(560 * nprofiles, 520))
+    axes = [Axis(fig[1, i], title=profile_labels[i], xlabel="Distance along profile, west to east (m)", ylabel=i == 1 ? "Ice thickness (m)" : "") for i in 1:nprofiles]
+    max_distances = zeros(Float64, nprofiles)
+    max_thickness = 0.0
+
+    for (model_index, group) in enumerate(model_groups)
+        for profile_index in 1:nprofiles
+            x, y, thickness, _, _, _ = _read_profile_sample_csv(group[profile_index])
+            if x[end] < x[1]
+                reverse!(x)
+                reverse!(y)
+                reverse!(thickness)
+            end
+            distance = _profile_distances(x, y)
+            finite = findall(value -> value !== missing && isfinite(value), thickness)
+            values = Float64.(thickness[finite])
+            isempty(values) && continue
+            max_distances[profile_index] = max(max_distances[profile_index], distance[end])
+            max_thickness = max(max_thickness, maximum(values))
+            lines!(axes[profile_index], distance[finite], values; label=model_labels[model_index], linewidth=2.5)
+        end
+    end
+
+    if hewitt_points !== nothing
+        for profile_index in 1:nprofiles
+            points = hewitt_points[profile_index]
+            hx = Float64.(points[1])
+            hy = Float64.(points[2])
+            max_distances[profile_index] = max(max_distances[profile_index], maximum(hx .+ xerr))
+            max_thickness = max(max_thickness, maximum(hy))
+            segments = Point2f[]
+            for (xvalue, yvalue) in zip(hx, hy)
+                push!(segments, Point2f(xvalue - xerr, yvalue), Point2f(xvalue + xerr, yvalue))
+            end
+            linesegments!(axes[profile_index], segments; color=:black, linewidth=1.5)
+            scatter!(axes[profile_index], hx, hy; label="Hewitt 1986", color=:black, marker=:circle, markersize=10)
+        end
+    end
+
+    for profile_index in 1:nprofiles
+        xlims!(axes[profile_index], 0, max_distances[profile_index])
+        max_thickness > 0 && ylims!(axes[profile_index], max_thickness, 0)
+    end
+    axislegend(axes[1]; position=:rb)
+
+    mkpath(dirname(output_path))
+    save(output_path, fig)
+    return fig
+end
+
+function _read_profile_sample_csv(path)
+    lines = readlines(path)
+    length(lines) > 1 || error("Profile CSV has no data rows: " * path)
+
+    x = Float64[]
+    y = Float64[]
+    z = Union{Missing,Float64}[]
+    z_lower = Union{Missing,Float64}[]
+    z_upper = Union{Missing,Float64}[]
+    thickness = Union{Missing,Float64}[]
+    has_bounds = false
+    has_thickness = false
+    for line in lines[2:end]
+        fields = split(line, ","; keepempty=true)
+        length(fields) >= 3 || continue
+        push!(x, parse(Float64, fields[1]))
+        push!(y, parse(Float64, fields[2]))
+        push!(z, isempty(strip(fields[3])) ? missing : parse(Float64, fields[3]))
+        if length(fields) >= 5
+            has_bounds = true
+            push!(z_lower, isempty(strip(fields[4])) ? missing : parse(Float64, fields[4]))
+            push!(z_upper, isempty(strip(fields[5])) ? missing : parse(Float64, fields[5]))
+        else
+            push!(z_lower, missing)
+            push!(z_upper, missing)
+        end
+        if length(fields) >= 7
+            has_thickness = true
+            push!(thickness, isempty(strip(fields[7])) ? missing : parse(Float64, fields[7]))
+        else
+            push!(thickness, missing)
+        end
+    end
+
+    length(x) >= 2 || error("A profile plot needs at least two sampled points: " * path)
+    return x, y, z, has_bounds ? z_lower : nothing, has_bounds ? z_upper : nothing, has_thickness ? thickness : nothing
+end
+
+function _profile_distances(x, y)
+    distance = zeros(Float64, length(x))
+    for i in 2:length(x)
+        distance[i] = distance[i - 1] + hypot(x[i] - x[i - 1], y[i] - y[i - 1])
+    end
+    return distance
 end

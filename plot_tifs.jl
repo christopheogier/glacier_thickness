@@ -61,7 +61,7 @@ thickness_paths = [
 
 labels = [
     "Consensus 2019 (surf. ~2000-2015)",
-    "Milan 2022",
+    "Milan 2022 (surf. ~2010-2020)",
     "Grab 2021 (surf. 2023)",
     "Frank 2026 (surf. 2023)",
 ]
