@@ -1,0 +1,11 @@
+*.tif
+*.tif.aux.xml
+*.asc
+*.csv
+*.png
+*.zip
+*.shp
+*.dbf
+*.prj
+*.shx
+*.kml

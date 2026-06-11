@@ -1,0 +1,4 @@
+[deps]
+ArchGDAL = "c9ce4bd3-c3d5-55b8-8973-c0e20141b8c3"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Rasters = "a3a2b9e3-a471-40c9-b274-f788e487c689"
