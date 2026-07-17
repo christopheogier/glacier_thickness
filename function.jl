@@ -3,6 +3,7 @@ using Rasters
 import ArchGDAL
 using Downloads
 using Printf
+using Statistics
 
 """
     plot_tif_files(tif_paths; output_path="output/plots/tif_overview.png")
@@ -314,6 +315,8 @@ function profile_dem_values(
     uncertainty_minus_path=nothing,
     uncertainty_plus_path=nothing,
     surface_path=nothing,
+    historical_surface_path=nothing,
+    profile_extension=0.0,
 )
     paths = profile_paths isa AbstractString ? [profile_paths] : collect(profile_paths)
     isempty(paths) && error("No profile files were provided.")
@@ -333,16 +336,19 @@ function profile_dem_values(
         uncertainty_minus = uncertainty_minus_path === nothing ? nothing : _read_sampling_raster(uncertainty_minus_path)
         uncertainty_plus = uncertainty_plus_path === nothing ? nothing : _read_sampling_raster(uncertainty_plus_path)
         surface = surface_path === nothing ? nothing : _read_sampling_raster(surface_path)
-        for sampling_raster in (uncertainty_minus, uncertainty_plus, surface)
+        historical_surface = historical_surface_path === nothing ? nothing : _read_sampling_raster(historical_surface_path)
+        for sampling_raster in (uncertainty_minus, uncertainty_plus, surface, historical_surface)
             sampling_raster !== nothing && sampling_raster.epsg != dem_epsg && error("Profile rasters must use the same EPSG as the bedrock DEM.")
         end
         has_uncertainty = uncertainty_minus !== nothing
         has_surface = surface !== nothing
+        has_historical_surface = historical_surface !== nothing
 
         out_paths = String[]
         for profile_path in paths
             coordinates = _read_profile_coordinates(profile_path; source_epsg)
             projected = _project_profile_to_dem(coordinates, dem_epsg)
+            profile_extension > 0 && (projected = _extend_profile(projected, profile_extension))
             sampled_xy = _densify_profile(projected, resolution)
             output_path = joinpath(output_dir, splitext(basename(profile_path))[1] * "_" * splitext(basename(dem_path))[1] * ".csv")
 
@@ -352,12 +358,13 @@ function profile_dem_values(
             end
 
             open(output_path, "w") do io
-                header = has_uncertainty || has_surface ? "x,y,z,z_lower,z_upper" : "x,y,z"
+                header = has_uncertainty || has_surface || has_historical_surface ? "x,y,z,z_lower,z_upper" : "x,y,z"
                 has_surface && (header *= ",surface_z,thickness")
+                has_historical_surface && (header *= ",historical_surface_z")
                 println(io, header)
                 for (x, y) in sampled_xy
                     z = _sample_raster_bilinear(array, gt, nodata, x, y)
-                    if has_uncertainty || has_surface
+                    if has_uncertainty || has_surface || has_historical_surface
                         z_lower = missing
                         z_upper = missing
                         if has_uncertainty
@@ -371,6 +378,10 @@ function profile_dem_values(
                             surface_z = _sample_raster_bilinear(surface.array, surface.gt, surface.nodata, x, y)
                             thickness = (z === missing || surface_z === missing) ? missing : surface_z - z
                             row *= string(",", surface_z === missing ? "" : surface_z, ",", thickness === missing ? "" : thickness)
+                        end
+                        if has_historical_surface
+                            historical_surface_z = _sample_raster_bilinear(historical_surface.array, historical_surface.gt, historical_surface.nodata, x, y)
+                            row *= string(",", historical_surface_z === missing ? "" : historical_surface_z)
                         end
                         println(io, row)
                     else
@@ -527,6 +538,22 @@ function _dem_spatial_resolution(gt)
     candidates = filter(>(0), [x_resolution, y_resolution])
     isempty(candidates) && error("Could not determine DEM spatial resolution.")
     return minimum(candidates)
+end
+
+function _extend_profile(coordinates, extension)
+    length(coordinates) >= 2 || error("A profile needs at least two coordinates.")
+    extension >= 0 || error("Profile extension must be non-negative.")
+    extension == 0 && return coordinates
+    first_dx = coordinates[1][1] - coordinates[2][1]
+    first_dy = coordinates[1][2] - coordinates[2][2]
+    last_dx = coordinates[end][1] - coordinates[end - 1][1]
+    last_dy = coordinates[end][2] - coordinates[end - 1][2]
+    first_length = hypot(first_dx, first_dy)
+    last_length = hypot(last_dx, last_dy)
+    (first_length > 0 && last_length > 0) || error("Cannot extend a profile with a zero-length end segment.")
+    extended_first = (coordinates[1][1] + extension * first_dx / first_length, coordinates[1][2] + extension * first_dy / first_length)
+    extended_last = (coordinates[end][1] + extension * last_dx / last_length, coordinates[end][2] + extension * last_dy / last_length)
+    return [extended_first; coordinates; extended_last]
 end
 
 function _densify_profile(coordinates, spacing)
@@ -1039,29 +1066,55 @@ function plot_profile_elevations(
     profile_csv_paths;
     output_path=joinpath(@__DIR__, "output", "plots", "profile_elevations.png"),
     labels=nothing,
+    gravimetry_path=nothing,
+    gravimetry_max_offset=15.0,
+    surface_label="SwissALTI3D surface 2023",
+    historical_surface_label="SwissALTI3D surface 2017",
+    distance_origin_stations=nothing,
+    assumed_snow_depths=2.0,
 )
     paths = profile_csv_paths isa AbstractString ? [profile_csv_paths] : collect(profile_csv_paths)
     isempty(paths) && error("No profile CSV files were provided.")
     labels === nothing && (labels = splitext.(basename.(paths)) .|> first)
     length(labels) == length(paths) || error("labels must have the same length as profile_csv_paths.")
+    snow_depths = assumed_snow_depths isa Number ? fill(Float64(assumed_snow_depths), length(paths)) : Float64.(collect(assumed_snow_depths))
+    length(snow_depths) == length(paths) || error("assumed_snow_depths must be a number or have one value per profile.")
+    gravimetry_points = gravimetry_path === nothing ? NamedTuple[] : _read_aletsch_gravimetry_points(gravimetry_path)
+    origin_stations = distance_origin_stations === nothing ? nothing : collect(distance_origin_stations)
+    origin_stations !== nothing && length(origin_stations) != length(paths) && error("distance_origin_stations must have one station number per profile.")
 
-    fig = Figure(size=(900, 760))
+    fig = Figure(size=(1250, 1200))
     ax = Axis(
         fig[1, 1],
         xlabel="Distance along profile, west to east (m)",
-        ylabel="Bedrock elevation (m)",
+        ylabel="Elevation (m; geoid)",
     )
-    thickness_ax = Axis(
-        fig[2, 1],
+    surface_axes = [Axis(
+        fig[profile_index + 1, 1],
         xlabel="Distance along profile, west to east (m)",
-        ylabel="Ice thickness (m)",
+        ylabel="Surface elevation (m; geoid)",
+    ) for (profile_index, label) in enumerate(labels)]
+    thickness_ax = Axis(
+        fig[length(paths) + 2, 1],
+        xlabel="Distance along profile, west to east (m)",
+        ylabel="Ice thickness (m) (2023)",
     )
+    for row in 2:(length(paths) + 1)
+        rowsize!(fig.layout, row, Fixed(210))
+    end
 
+    min_distance = 0.0
     max_distance = 0.0
+    profile_min_distances = Float64[]
+    profile_max_distances = Float64[]
     max_thickness = 0.0
+    profile_data = NamedTuple[]
+    colors = Makie.wong_colors()
 
-    for (path, label) in zip(paths, labels)
+    for (profile_index, (path, label)) in enumerate(zip(paths, labels))
         x, y, z, z_lower, z_upper, thickness = _read_profile_sample_csv(path)
+        surface = _read_profile_surface_csv(path)
+        historical_surface = _read_profile_surface_csv(path; column="historical_surface_z")
         if x[end] < x[1]
             reverse!(x)
             reverse!(y)
@@ -1069,35 +1122,182 @@ function plot_profile_elevations(
             z_lower !== nothing && reverse!(z_lower)
             z_upper !== nothing && reverse!(z_upper)
             thickness !== nothing && reverse!(thickness)
+            surface !== nothing && reverse!(surface)
+            historical_surface !== nothing && reverse!(historical_surface)
         end
 
         distance = _profile_distances(x, y)
+        if origin_stations !== nothing
+            origin_matches = filter(point -> point.station == origin_stations[profile_index], gravimetry_points)
+            length(origin_matches) == 1 || error("Could not uniquely find distance-origin station " * string(origin_stations[profile_index]) * ".")
+            origin_projection = _project_point_onto_profile(origin_matches[1].x, origin_matches[1].y, x, y, distance)
+            distance .-= origin_projection.distance
+        end
+        color = colors[mod1(profile_index, length(colors))]
+        push!(profile_data, (; x, y, distance, surface, historical_surface, label, color))
+        push!(profile_min_distances, distance[1])
+        push!(profile_max_distances, distance[end])
+        min_distance = min(min_distance, distance[1])
         max_distance = max(max_distance, distance[end])
         if z_lower !== nothing && z_upper !== nothing
             bound_finite = findall(i -> z_lower[i] !== missing && z_upper[i] !== missing && isfinite(z_lower[i]) && isfinite(z_upper[i]), eachindex(z))
             band!(ax, distance[bound_finite], Float64.(z_lower[bound_finite]), Float64.(z_upper[bound_finite]); color=(:gray, 0.22))
         end
         finite = findall(value -> value !== missing && isfinite(value), z)
-        lines!(ax, distance[finite], Float64.(z[finite]); label=label, linewidth=2.5)
+        lines!(ax, distance[finite], Float64.(z[finite]); label=string(label, " bedrock"), color, linewidth=2.5)
+        if surface !== nothing
+            surface_finite = findall(value -> value !== missing && isfinite(value), surface)
+            lines!(ax, distance[surface_finite], Float64.(surface[surface_finite]); label=string(label, " ", surface_label), color, linestyle=:dash, linewidth=2.5)
+            if historical_surface !== nothing
+                historical_finite = findall(value -> value !== missing && isfinite(value), historical_surface)
+                lines!(ax, distance[historical_finite], Float64.(historical_surface[historical_finite]); label=string(label, " ", historical_surface_label), color, linestyle=:dot, linewidth=2.5)
+            end
+            lines!(surface_axes[profile_index], distance[surface_finite], Float64.(surface[surface_finite]); label=string(label, " ", surface_label), color, linestyle=:dash, linewidth=2.5)
+        end
         if thickness !== nothing
             thickness_finite = findall(value -> value !== missing && isfinite(value), thickness)
             thickness_values = Float64.(thickness[thickness_finite])
             !isempty(thickness_values) && (max_thickness = max(max_thickness, maximum(thickness_values)))
-            lines!(thickness_ax, distance[thickness_finite], thickness_values; label=label, linewidth=2.5)
+            lines!(thickness_ax, distance[thickness_finite], thickness_values; label=label, color, linewidth=2.5)
         end
+    end
+
+    if gravimetry_path !== nothing
+        matched_counts = zeros(Int, length(profile_data))
+        surface_differences = [Float64[] for _ in profile_data]
+        gnss_elevations = [Float64[] for _ in profile_data]
+        matched_distances = [Float64[] for _ in profile_data]
+        unmatched_stations = Int[]
+        for point in gravimetry_points
+            matches = [_project_point_onto_profile(point.x, point.y, profile.x, profile.y, profile.distance) for profile in profile_data]
+            profile_index = argmin(getproperty.(matches, :offset))
+            match = matches[profile_index]
+            if match.offset <= gravimetry_max_offset
+                profile = profile_data[profile_index]
+                push!(gnss_elevations[profile_index], point.elevation)
+                push!(matched_distances[profile_index], match.distance)
+                snow_depth = snow_depths[profile_index]
+                ice_surface_elevation = point.elevation - snow_depth
+                surface_2023_elevation = _interpolate_profile_value(profile.distance, profile.surface, match.distance)
+                surface_2023_elevation !== missing && push!(surface_differences[profile_index], point.elevation - surface_2023_elevation)
+                panel_gnss_label = matched_counts[profile_index] == 0 ? "Gravimetry station" : nothing
+                panel_ice_label = matched_counts[profile_index] == 0 ? string("Ice surface elevation, assuming ", snow_depth, " m of snow depth") : nothing
+                top_gnss_label = sum(matched_counts) == 0 ? "Gravimetry station" : nothing
+                scatter!(ax, [match.distance], [point.elevation]; color=profile.color, marker=:circle, strokecolor=:black, strokewidth=0.7, markersize=10, label=top_gnss_label)
+                scatter!(surface_axes[profile_index], [match.distance], [point.elevation]; color=profile.color, marker=:circle, strokecolor=:black, strokewidth=0.7, markersize=11, label=panel_gnss_label)
+                scatter!(surface_axes[profile_index], [match.distance], [ice_surface_elevation]; color=profile.color, marker=:utriangle, strokecolor=:black, strokewidth=0.7, markersize=11, label=panel_ice_label)
+                text!(ax, match.distance, point.elevation; text=string(point.station), color=profile.color, fontsize=10, align=(:left, :bottom), offset=(4, 4))
+                text!(surface_axes[profile_index], match.distance, point.elevation; text=string(point.station), color=profile.color, fontsize=10, align=(:left, :bottom), offset=(4, 4))
+                matched_counts[profile_index] += 1
+            else
+                push!(unmatched_stations, point.station)
+            end
+        end
+        for (profile_index, distances) in enumerate(matched_distances)
+            isempty(distances) && continue
+            profile_color = profile_data[profile_index].color
+            last_station_distance = maximum(distances)
+            vlines!(ax, [0.0]; color=:black, linestyle=:dash, linewidth=2.0)
+            vlines!(ax, [last_station_distance]; color=profile_color, linestyle=:dash, linewidth=2.0)
+            vlines!(surface_axes[profile_index], [0.0]; color=:black, linestyle=:dash, linewidth=2.0)
+            vlines!(surface_axes[profile_index], [last_station_distance]; color=profile_color, linestyle=:dash, linewidth=2.0)
+            vlines!(thickness_ax, [0.0]; color=:black, linestyle=:dash, linewidth=2.0)
+            vlines!(thickness_ax, [last_station_distance]; color=profile_color, linestyle=:dash, linewidth=2.0)
+        end
+        for (profile_index, elevations) in enumerate(gnss_elevations)
+            isempty(elevations) && continue
+            ylims!(surface_axes[profile_index], minimum(elevations) - 10.0, maximum(elevations) + 10.0)
+        end
+        for (profile_index, differences) in enumerate(surface_differences)
+            isempty(differences) && continue
+            difference_std = length(differences) > 1 ? std(differences) : 0.0
+            annotation = @sprintf(
+                "Δz = GNSS May 2026 − SwissALTI3D 2023\nmean = %.2f m, std = %.2f m (n = %d)",
+                mean(differences), difference_std, length(differences),
+            )
+            text!(surface_axes[profile_index], 0.02, 0.02; text=annotation, space=:relative, align=(:left, :bottom), fontsize=11)
+        end
+        @info "Matched gravimetry stations to profiles" matched_counts gravimetry_max_offset unmatched_stations
     end
 
     text!(ax, 0.0, 1.03; text="West", space=:relative, align=(:left, :bottom), fontsize=13)
     text!(ax, 1.0, 1.03; text="East", space=:relative, align=(:right, :bottom), fontsize=13)
-    xlims!(ax, 0, max_distance)
-    xlims!(thickness_ax, 0, max_distance)
+    xlims!(ax, min_distance, max_distance)
+    for (surface_axis, profile_min_distance, profile_max_distance) in zip(surface_axes, profile_min_distances, profile_max_distances)
+        xlims!(surface_axis, profile_min_distance, profile_max_distance)
+    end
+    xlims!(thickness_ax, min_distance, max_distance)
     max_thickness > 0 && ylims!(thickness_ax, max_thickness, 0)
-    axislegend(ax; position=:rt)
-    axislegend(thickness_ax; position=:rt)
+    Legend(fig[1, 2], ax; backgroundcolor=:transparent, framevisible=false)
+    for surface_axis in surface_axes
+        axislegend(surface_axis; position=:rt, backgroundcolor=:transparent, framevisible=false)
+    end
+    axislegend(thickness_ax; position=:rt, backgroundcolor=:transparent, framevisible=false)
 
     mkpath(dirname(output_path))
     save(output_path, fig)
     return fig
+end
+
+function _interpolate_profile_value(distance, values, target_distance)
+    values === nothing && return missing
+    target_distance < distance[1] && return missing
+    target_distance > distance[end] && return missing
+    index = searchsortedlast(distance, target_distance)
+    index == length(distance) && return values[end]
+    lower, upper = values[index], values[index + 1]
+    (lower === missing || upper === missing) && return missing
+    segment_length = distance[index + 1] - distance[index]
+    fraction = segment_length == 0 ? 0.0 : (target_distance - distance[index]) / segment_length
+    return Float64(lower) + fraction * (Float64(upper) - Float64(lower))
+end
+
+function _read_profile_surface_csv(path; column="surface_z")
+    lines = readlines(path)
+    headers = split(strip(lines[1]), ",")
+    surface_index = findfirst(==(column), headers)
+    surface_index === nothing && return nothing
+    surface = Union{Missing,Float64}[]
+    for line in lines[2:end]
+        fields = split(line, ","; keepempty=true)
+        value = surface_index <= length(fields) ? strip(fields[surface_index]) : ""
+        push!(surface, isempty(value) ? missing : parse(Float64, value))
+    end
+    return surface
+end
+
+"""Read LV95 gravimetry positions and geoid-referenced heights."""
+function _read_aletsch_gravimetry_points(path)
+    lines = readlines(path)
+    length(lines) > 1 || error("Gravimetry file has no data rows: " * path)
+    headers = strip.(split(strip(lines[1]), ","))
+    required = ("Gravi_n", "Rechtswert", "Hochwert", "Orthom. Höhe")
+    indices = map(name -> findfirst(==(name), headers), required)
+    any(isnothing, indices) && error("Missing one of " * join(required, ", ") * " in " * path)
+    station_index, x_index, y_index, elevation_index = Int.(indices)
+    points = NamedTuple[]
+    for line in lines[2:end]
+        fields = strip.(split(strip(line), ","))
+        length(fields) < maximum(indices) && continue
+        push!(points, (station=parse(Int, fields[station_index]), x=parse(Float64, fields[x_index]), y=parse(Float64, fields[y_index]), elevation=parse(Float64, fields[elevation_index])))
+    end
+    return points
+end
+
+function _project_point_onto_profile(px, py, x, y, cumulative_distance)
+    best_offset, best_distance = Inf, NaN
+    for i in 1:(length(x) - 1)
+        dx, dy = x[i + 1] - x[i], y[i + 1] - y[i]
+        segment_length_squared = dx^2 + dy^2
+        t = segment_length_squared == 0 ? 0.0 : clamp(((px - x[i]) * dx + (py - y[i]) * dy) / segment_length_squared, 0.0, 1.0)
+        projected_x, projected_y = x[i] + t * dx, y[i] + t * dy
+        offset = hypot(px - projected_x, py - projected_y)
+        if offset < best_offset
+            best_offset = offset
+            best_distance = cumulative_distance[i] + t * sqrt(segment_length_squared)
+        end
+    end
+    return (; distance=best_distance, offset=best_offset)
 end
 
 function plot_biafo_thickness_profiles(
