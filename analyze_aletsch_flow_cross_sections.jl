@@ -1,6 +1,6 @@
 include("plot_aletsch_gpr_profiles.jl")
 
-const FLOW_GROUPS = [[4, 5], [7], [3, 9], [1, 13]]
+const FLOW_GROUPS = [[4, 5], [7], [3, 9], [11], [1, 13]]
 const GRAB_PROFILE_PATHS = [
     joinpath(@__DIR__, "output", "profiles", "Profile_1_B36-26_GlacierBed_Grab2021.csv"),
     joinpath(@__DIR__, "output", "profiles", "Profile_2_B36-26_GlacierBed_Grab2021.csv"),
@@ -131,19 +131,47 @@ function nelder_mead(objective, start, step; iterations=1200)
     simplex[argmin(values)]
 end
 
-function fit_power_shape(section)
-    good = findall(isfinite, section.bed); x, z = section.distance[good], section.bed[good]
-    imin = argmin(z); width, relief = maximum(x)-minimum(x), maximum(z)-minimum(z)
-    start = [x[imin], z[imin], log(max(relief/(0.5width)^2,1e-6)), log(2.0)]
-    objective(p) = begin
-        x0,z0,loga,logb=p; a,b=exp(loga),exp(logb)
-        (0.35 <= b <= 6 && minimum(x)-0.2width <= x0 <= maximum(x)+0.2width) || return 1e30
-        sum(abs2, z .- (z0 .+ a .* abs.(x.-x0).^b))/length(x)
-    end
-    p = nelder_mead(objective,start,[0.05width,0.05max(relief,1),0.3,0.15])
-    x0,z0,loga,logb=p; a,b=exp(loga),exp(logb)
-    (; a,b,x0,z0,rmse=sqrt(objective(p)),fitted=z0 .+ a .* abs.(section.distance.-x0).^b)
+function anchored_power_values(distance, xleft, zleft, xright, zright, x0, z0, b)
+    [x < xleft || x > xright ? NaN :
+     x <= x0 ? z0 + (zleft-z0) * ((x0-x)/(x0-xleft))^b :
+               z0 + (zright-z0) * ((x-x0)/(xright-x0))^b for x in distance]
 end
+
+function anchored_fit(section; fixed_b=nothing)
+    good = findall(isfinite, section.bed)
+    length(good) >= 3 || error("At least three bedrock points are required")
+    left, right = first(good), last(good)
+    xleft, xright = section.distance[left], section.distance[right]
+    zleft, zright = section.surface[left], section.surface[right]
+    isfinite(zleft) && isfinite(zright) || error("Surface anchors must be finite")
+    x, z = section.distance[good], section.bed[good]
+    width = xright-xleft
+    imin = argmin(z)
+    start_x0 = clamp(x[imin], xleft+0.05width, xright-0.05width)
+    start_z0 = minimum(z)
+    function loss(x0, z0, b)
+        (xleft+0.01width < x0 < xright-0.01width && 0.35 <= b <= 6 && z0 < min(zleft,zright)) || return 1e30
+        prediction = anchored_power_values(x, xleft, zleft, xright, zright, x0, z0, b)
+        sum(abs2, z .- prediction) / length(z)
+    end
+    if fixed_b === nothing
+        objective_free(p) = loss(p[1], p[2], exp(p[3]))
+        p = nelder_mead(objective_free, [start_x0,start_z0,log(1.5)], [0.05width,20.0,0.15])
+        x0,z0,logb = p; b=exp(logb)
+        rmse = sqrt(objective_free(p))
+    else
+        b = Float64(fixed_b)
+        objective_fixed(p) = loss(p[1], p[2], b)
+        p = nelder_mead(objective_fixed, [start_x0,start_z0], [0.05width,20.0])
+        x0,z0 = p
+        rmse = sqrt(objective_fixed(p))
+    end
+    fitted = anchored_power_values(section.distance, xleft, zleft, xright, zright, x0, z0, b)
+    (; a=NaN,b,x0,z0,xleft,zleft,xright,zright,rmse,fitted)
+end
+
+fit_power_shape(section) = anchored_fit(section)
+fit_parabolic_shape(section) = anchored_fit(section; fixed_b=2.0)
 
 function fit_label_position(section)
     finite_bed = filter(isfinite, section.bed)
@@ -168,49 +196,55 @@ function main_flow_analysis()
     surface = read_raster(joinpath(ALETSCH,"alti3D_2m_Aletsch_2023.tif"))
     sections = [average_group(g,profiles,surface) for g in FLOW_GROUPS]
     fits = fit_power_shape.(sections)
-    grab_sections = read_grab_profile.(GRAB_PROFILE_PATHS)
-    grab_fits = fit_power_shape.(grab_sections)
+    parabolic_fits = fit_parabolic_shape.(sections)
     fig = Figure(size=(2100,1450))
-    for (i,(group,section,fit)) in enumerate(zip(FLOW_GROUPS,sections,fits))
+    for (i,(group,section,fit,parabolic_fit)) in enumerate(zip(FLOW_GROUPS,sections,fits,parabolic_fits))
         fit_index = first(filter(j -> PROFILE_SPECS[j].year == 2011, group))
         label=profile_label(PROFILE_SPECS[fit_index])
-        ax=Axis(fig[cld(i,2),mod1(i,2)],title="$label   RMSE = $(round(fit.rmse,digits=2)) m",
+        ax=Axis(fig[cld(i,2),mod1(i,2)],title=label,
                 xlabel="West-to-east distance (m)",ylabel="Elevation (m a.s.l.)")
+        profile_color = Makie.wong_colors()[mod1(i, length(Makie.wong_colors()))]
+        profile_number = PROFILE_SPECS[fit_index].number
+        scatter!(ax, [Point2f(0.065, 0.09)]; space=:relative, marker=:rect,
+                 markersize=Vec2f(54, 40), color=:white,
+                 strokecolor=profile_color, strokewidth=2)
+        text!(ax, 0.065, 0.09; text=string(profile_number), space=:relative,
+              color=profile_color, fontsize=26, font=:bold, align=(:center, :center))
         lines!(ax,section.distance,section.surface;color=:dodgerblue3,linewidth=2,label="2023 surface")
         lines!(ax,section.distance,section.measured;color=:black,linewidth=2.8,label=length(group) > 1 ? "2011 bedrock used for fit" : "GPR bedrock used for fit")
         lines!(ax,section.distance,section.extended;color=:red3,linewidth=3,label="Interpolated to surface")
         lines!(ax,section.distance,fit.fitted;color=:forestgreen,linestyle=:dash,linewidth=2.5,label="power-law fit")
-        fit_label = fit_label_position(section)
-        text!(ax,fit_label.x,fit_label.y;text="b = $(round(fit.b,digits=2))",
-              color=:forestgreen,fontsize=20,font=:bold,align=(:center,:center))
-        if i == 1
-            label_curve!(ax,section.distance,section.surface,"2023 glacier surface",:dodgerblue3;fraction=0.72)
-            label_curve!(ax,section.distance,section.measured,"2011 GPR (used for fit)",:black;fraction=0.62)
-            label_curve!(ax,section.distance,fit.fitted,"power-law fit",:forestgreen;fraction=0.48)
-        end
-    end
-    for (i,(section,fit)) in enumerate(zip(grab_sections,grab_fits))
-        ax=Axis(fig[3,i],title="Gravimetry Profile $i   RMSE = $(round(fit.rmse,digits=2)) m",
-                xlabel="West-to-east distance (m)",ylabel="Elevation (m a.s.l.)")
-        lines!(ax,section.distance,section.surface;color=:dodgerblue3,linewidth=2)
-        lines!(ax,section.distance,section.bed;color=:deeppink2,linewidth=3)
-        lines!(ax,section.distance,fit.fitted;color=:forestgreen,linestyle=:dash,linewidth=2.5)
-        fit_label = fit_label_position(section)
-        text!(ax,fit_label.x,fit_label.y;text="b = $(round(fit.b,digits=2))",
-              color=:forestgreen,fontsize=20,font=:bold,align=(:center,:center))
-        text!(ax,0.5,0.04;text="interpolated bedrock from Grab et al. 2021",space=:relative,
-              color=:deeppink2,fontsize=14,font=:bold,align=(:center,:bottom))
+        lines!(ax,section.distance,parabolic_fit.fitted;color=:purple4,linestyle=:dash,linewidth=2.5,label="hypothetical parabolic fit (b = 2)")
+        text!(ax,0.5,0.53;text="b = $(round(fit.b,digits=2)) (RMSE = $(round(fit.rmse,digits=2)) m)",
+              space=:relative,color=:forestgreen,fontsize=18,font=:bold,align=(:center,:center))
+        text!(ax,0.5,0.47;text="b = 2 (RMSE = $(round(parabolic_fit.rmse,digits=2)) m)",
+              space=:relative,color=:purple4,fontsize=18,font=:bold,align=(:center,:center))
     end
     fit_profile_indices = [first(filter(i -> PROFILE_SPECS[i].year == 2011, group)) for group in FLOW_GROUPS]
     gravity = read_gravimetry(joinpath(ALETSCH,"profiles_gravi_aletsch","gps_points_20260513.txt"))
     map_ax = plot_location_map!(fig[1:3,3], PROFILE_SPECS[fit_profile_indices],
-                                profiles[fit_profile_indices], gravity)
-    for (i,section) in enumerate(grab_sections)
-        lines!(map_ax,section.x,section.y;color=:deeppink2,linewidth=4)
-        label_index = cld(length(section.x),2)
-        text!(map_ax,section.x[label_index],section.y[label_index];text="Profile $i",
-              color=:deeppink4,fontsize=14,font=:bold,align=(:center,:bottom),offset=(0,10))
-    end
+                                profiles[fit_profile_indices], gravity;
+                                profile_numbers=[PROFILE_SPECS[i].number for i in fit_profile_indices])
+    b_values = getfield.(fits, :b)
+    mean_b = sum(b_values) / length(b_values)
+    std_b = sqrt(sum(abs2, b_values .- mean_b) / (length(b_values) - 1))
+    summary_ax = Axis(fig[3,2])
+    hidedecorations!(summary_ax)
+    hidespines!(summary_ax)
+    text!(summary_ax, 0.5, 0.78; space=:relative,
+          text="Mean b for the $(length(fits)) GPR cross-sections\nmean = $(round(mean_b,digits=2)), SD = $(round(std_b,digits=2))",
+          color=:forestgreen, fontsize=22, font=:bold, align=(:center,:center))
+    legend_elements = [LineElement(color=:dodgerblue3, linewidth=2),
+                       LineElement(color=:black, linewidth=2.8),
+                       LineElement(color=:red3, linewidth=3),
+                       LineElement(color=:forestgreen, linestyle=:dash, linewidth=2.5),
+                       LineElement(color=:purple4, linestyle=:dash, linewidth=2.5)]
+    legend_labels = ["2023 surface", "GPR bedrock used for fit", "Interpolated to surface",
+                     "Power-law fit", "Hypothetical parabolic fit (b = 2)"]
+    Legend(fig[3,2], legend_elements, legend_labels; labelsize=22, framevisible=true,
+           patchsize=(48, 26), rowgap=9, padding=(18, 18, 16, 16),
+           tellheight=false, tellwidth=false, halign=:center, valign=:bottom,
+           margin=(12,12,12,12))
     Label(fig[0,1:3],"Aletsch flow-transverse cross-sections: z = z₀ + a|x-x₀|ᵇ",fontsize=22)
     output=joinpath(OUTPUT_DIR,"aletsch_flow_cross_section_powerlaw_fits.png")
     save(output,fig;px_per_unit=1.5)
@@ -221,17 +255,9 @@ function main_flow_analysis()
             fit_index = first(filter(i -> PROFILE_SPECS[i].year == 2011, group))
             println(io, join((join(profile_label.(PROFILE_SPECS[group]), "+"), profile_label(PROFILE_SPECS[fit_index]), fit.a, fit.b, fit.x0, fit.z0, fit.rmse), ","))
         end
-        for (i,fit) in enumerate(grab_fits)
-            println(io, join(("Gravimetry Profile $i", "Grab et al. (2021)", fit.a, fit.b, fit.x0, fit.z0, fit.rmse), ","))
-        end
     end
     for (group,fit) in zip(FLOW_GROUPS,fits)
         println(join(profile_label.(PROFILE_SPECS[group])," + "),": b=",round(fit.b,digits=4),", RMSE=",round(fit.rmse,digits=2)," m")
-    end
-    for (i,fit) in enumerate(grab_fits)
-        println("Gravimetry Profile $i (Grab et al. 2021): a=",fit.a,", b=",round(fit.b,digits=4),
-                ", x0=",round(fit.x0,digits=2)," m, z0=",round(fit.z0,digits=2),
-                " m, RMSE=",round(fit.rmse,digits=2)," m")
     end
     println("Saved ",output," and ",csv)
 end

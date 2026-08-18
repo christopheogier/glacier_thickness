@@ -186,7 +186,27 @@ function read_map_rgb(path; max_dimension=1800)
     end
 end
 
-function plot_location_map!(layout, specs, profiles, gravity)
+function additional_bedrock_profiles(excluded_specs)
+    excluded = Set(normpath(profile_path(spec)) for spec in excluded_specs)
+    paths = String[]
+    for (root, _, files) in walkdir(GPR_DIR), file in files
+        endswith(file, "_Bedrock.txt") || continue
+        path = normpath(joinpath(root, file))
+        path in excluded || push!(paths, path)
+    end
+    profiles = []
+    for path in paths
+        profile = read_profile(path)
+        valid = isfinite.(profile.bed) .& (profile.bed .> 0)
+        any(valid) || continue
+        x = [valid[i] ? profile.x[i] : NaN for i in eachindex(valid)]
+        y = [valid[i] ? profile.y[i] : NaN for i in eachindex(valid)]
+        push!(profiles, (; x, y))
+    end
+    profiles
+end
+
+function plot_location_map!(layout, specs, profiles, gravity; profile_numbers=nothing)
     map_paths = [joinpath(ALETSCH, "swiss-map-raster25_2023_1269_krel_1.25_2056.tif"),
                  joinpath(ALETSCH, "swiss-map-raster25_2023_1249_krel_1.25_2056.tif")]
     maps = read_map_rgb.(map_paths)
@@ -194,6 +214,20 @@ function plot_location_map!(layout, specs, profiles, gravity)
               xlabel="Easting (m)", ylabel="Northing (m)", aspect=DataAspect())
     for map in maps
         image!(ax, map.extent[1]..map.extent[2], map.extent[3]..map.extent[4], map.rgb)
+    end
+    allx = vcat([p.x for p in profiles]..., gravity.x)
+    ally = vcat([p.y for p in profiles]..., gravity.y)
+    xlimits = extrema(allx) .+ (-700, 700)
+    ylimits = (minimum(ally) - 700, 1_150_000)
+    first_additional = true
+    for profile in additional_bedrock_profiles(specs)
+        in_view = any(isfinite(x) && isfinite(y) &&
+                      xlimits[1] <= x <= xlimits[2] && ylimits[1] <= y <= ylimits[2]
+                      for (x, y) in zip(profile.x, profile.y))
+        in_view || continue
+        lines!(ax, profile.x, profile.y; color=:black, linewidth=1.2,
+               label=first_additional ? "Bedrock reflection from airborne-GPR (2009–2011)" : nothing)
+        first_additional = false
     end
     colors = Makie.wong_colors()
     for (i, (spec, profile)) in enumerate(zip(specs, profiles))
@@ -205,14 +239,21 @@ function plot_location_map!(layout, specs, profiles, gravity)
         label_offset = label_offsets[mod1(i, 4)]
         text!(ax, profile.x[label_index], profile.y[label_index]; text=profile_label(spec), color=:black,
               fontsize=13, font=:bold, align=(:center, :center), offset=label_offset)
+        if profile_numbers !== nothing
+            number_offset = (label_offset[1], label_offset[2] + (label_offset[2] >= 0 ? 27 : -27))
+            scatter!(ax, [profile.x[label_index]], [profile.y[label_index]];
+                     marker=:rect, markersize=Vec2f(48, 36), color=:white,
+                     strokecolor=color, strokewidth=2, marker_offset=number_offset)
+            text!(ax, profile.x[label_index], profile.y[label_index];
+                  text=string(profile_numbers[i]), color, fontsize=25, font=:bold,
+                  align=(:center, :center), offset=number_offset)
+        end
     end
     scatter!(ax, gravity.x, gravity.y; marker=:diamond, color=:magenta,
              strokecolor=:white, strokewidth=1, markersize=11, label="Gravimetry (2026)")
-    axislegend(ax; position=:rt)
-    allx = vcat([p.x for p in profiles]..., gravity.x)
-    ally = vcat([p.y for p in profiles]..., gravity.y)
-    xlims!(ax, extrema(allx) .+ (-700, 700))
-    ylims!(ax, minimum(ally) - 700, 1_150_000)
+    axislegend(ax; position=:rt, labelsize=17)
+    xlims!(ax, xlimits)
+    ylims!(ax, ylimits)
     return ax
 end
 
