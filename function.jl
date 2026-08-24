@@ -183,14 +183,27 @@ function plot_aletsch_thickness_overview(
             heatmap_plot = heatmap!(ax, raster; colormap, colorrange)
             tightlimits!(ax)
 
+            volume_mask_path = nothing
             if outline_path !== nothing
                 warped_outline_path = joinpath(tmpdir, "outline_$i.tif")
                 _warp_raster_to_match(outline_path, path, warped_outline_path; method="near")
+                volume_mask_path = warped_outline_path
                 outline = map(v -> (!ismissing(v) && isfinite(Float64(v)) && Float64(v) > 0) ? 1.0 : 0.0, Raster(warped_outline_path))
                 contour!(ax, outline; levels=[0.5], color=:black, linewidth=1.5)
             end
 
+            volume_km3 = _raster_ice_volume(path; mask_path=volume_mask_path) / 1e9
             scatter!(ax, [max_point.x], [max_point.y]; color=:red, strokecolor=:white, strokewidth=1.5, markersize=11)
+            text!(
+                ax,
+                0.03,
+                0.10;
+                text="ice volume = " * @sprintf("%.2f", volume_km3) * " km³",
+                space=:relative,
+                fontsize=13,
+                color=:black,
+                align=(:left, :bottom),
+            )
             text!(
                 ax,
                 0.03,
@@ -213,6 +226,32 @@ function plot_aletsch_thickness_overview(
     mkpath(dirname(output_path))
     save(output_path, fig)
     return fig
+end
+
+function _raster_ice_volume(path; mask_path=nothing)
+    ArchGDAL.read(path) do dataset
+        thickness = ArchGDAL.read(ArchGDAL.getband(dataset, 1))
+        gt = ArchGDAL.getgeotransform(dataset)
+        cell_area = abs(gt[2] * gt[6] - gt[3] * gt[5])
+
+        mask = if mask_path === nothing
+            nothing
+        else
+            ArchGDAL.read(mask_path) do mask_dataset
+                mask_array = ArchGDAL.read(ArchGDAL.getband(mask_dataset, 1))
+                size(mask_array) == size(thickness) || error("Thickness and volume-mask rasters must share a grid.")
+                mask_array
+            end
+        end
+
+        thickness_sum = 0.0
+        for index in CartesianIndices(thickness)
+            value = Float64(thickness[index])
+            inside = mask === nothing || (isfinite(Float64(mask[index])) && Float64(mask[index]) > 0)
+            isfinite(value) && value > 0 && inside && (thickness_sum += value)
+        end
+        thickness_sum * cell_area
+    end
 end
 
 function _colorbar_ticks(color_max)
@@ -1028,6 +1067,10 @@ function plot_biafo_thickness_comparison_with_milan(
         _raster_maximum_location_on_positive_mask(milan_path, consensus_path),
         _raster_maximum_location_on_positive_mask(frank_path, consensus_path),
     ]
+    volume_km3 = [
+        _raster_ice_volume(path; mask_path=consensus_path) / 1e9
+        for path in (consensus_path, milan_path, frank_path)
+    ]
 
     fig = Figure(size=(1780, 440))
 
@@ -1040,6 +1083,16 @@ function plot_biafo_thickness_comparison_with_milan(
         contour!(ax, outline; levels=[0.5], color=:black, linewidth=1.5)
         tightlimits!(ax)
         _annotate_maximum_thickness!(ax, max_points[i])
+        text!(
+            ax,
+            0.03,
+            0.10;
+            text="ice volume = " * @sprintf("%.2f", volume_km3[i]) * " km³",
+            space=:relative,
+            fontsize=13,
+            color=:black,
+            align=(:left, :bottom),
+        )
     end
 
     ax4 = Axis(fig[1, 4], title="Consensus 2019 - Frank 2026", aspect=DataAspect())
