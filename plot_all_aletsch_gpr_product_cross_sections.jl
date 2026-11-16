@@ -6,6 +6,8 @@ const GRAB_PATH = joinpath(ALETSCH, "B36-26_GlacierBed_Grab2021.tif")
 const MILLAN_PATH = joinpath(ALETSCH, "THICKNESS_RGI-11_2021July09_on_grab2021_grid.tif")
 const FRANK_PATH = joinpath(ALETSCH, "RGI60-11.01222_bedrock_franck2026_on_grab2021_grid.tif")
 const FARINOTTI_PATH = joinpath(ALETSCH, "RGI60-11.01450_thickness_Farinotti2019.tif")
+# IceBoost v2.0 individual-glacier product: https://doi.org/10.5281/zenodo.17724512
+const ICEBOOST_PATH = joinpath(ALETSCH, "RGI60-11.01450.tif")
 
 function comparison_sections(surface_raster, grab_raster)
     sections = Dict{String,Any}(section.label => section for section in
@@ -79,6 +81,7 @@ function main()
     millan_raster = read_raster(MILLAN_PATH)
     frank_raster = read_raster(FRANK_PATH)
     farinotti_raster = read_raster(FARINOTTI_PATH)
+    iceboost_raster = read_raster(ICEBOOST_PATH)
     sections = comparison_sections(surface_raster, grab_raster)
 
     ncols = 2
@@ -129,6 +132,49 @@ function main()
     output = joinpath(OUTPUT_DIR, "aletsch_all_models_cross_sections.png")
     save(output, fig; px_per_unit=1.5)
     println("Saved $output ($(length(sections)) unique GPR transects)")
+
+    p21 = only(filter(section -> section.label == "2011 F1-P21", sections))
+    p21_grab = sample_section(grab_raster, p21)
+    p21_millan = p21.surface .- sample_section(millan_raster, p21)
+    p21_frank = sample_section(frank_raster, p21)
+    p21_farinotti = p21.surface .- sample_section_utm32(farinotti_raster, p21)
+    p21_iceboost = p21.surface .- sample_section_utm32(iceboost_raster, p21)
+
+    p21_fig = Figure(size=(1900, 1250), figure_padding=45)
+    p21_ax = Axis(p21_fig[1, 1], title="P21 cross-section",
+                  xlabel="Distance along transect (m)",
+                  ylabel="Elevation (m a.s.l.)",
+                  titlesize=34, xlabelsize=28, ylabelsize=28,
+                  xticklabelsize=23, yticklabelsize=23)
+    lines!(p21_ax, p21.distance, p21.surface; color=:dodgerblue3, linewidth=4)
+    lines!(p21_ax, p21.distance, p21.bed; color=:black, linewidth=5)
+    lines!(p21_ax, p21.distance, p21_grab; color=:deeppink2, linewidth=4)
+    lines!(p21_ax, p21.distance, p21_millan; color=:forestgreen, linewidth=4)
+    lines!(p21_ax, p21.distance, p21_frank; color=:darkorange, linewidth=4)
+    lines!(p21_ax, p21.distance, p21_farinotti; color=:navy, linewidth=4)
+    lines!(p21_ax, p21.distance, p21_iceboost; color=:purple3, linewidth=4)
+
+    p21_elements = [LineElement(color=:dodgerblue3, linewidth=4),
+                    LineElement(color=:black, linewidth=5),
+                    LineElement(color=:deeppink2, linewidth=4),
+                    LineElement(color=:forestgreen, linewidth=4),
+                    LineElement(color=:darkorange, linewidth=4),
+                    LineElement(color=:navy, linewidth=4)]
+    push!(p21_elements, LineElement(color=:purple3, linewidth=4))
+    p21_labels = ["2023 surface", "GPR transect", "Grab et al. (2021)",
+                  "Millan et al. (2022)", "Frank et al. (2026)",
+                  "Farinotti et al. (2019) consensus"]
+    push!(p21_labels, "IceBoost v2.0 (2026)")
+    Legend(p21_fig[2, 1], p21_elements, p21_labels;
+           orientation=:horizontal, nbanks=2, labelsize=22,
+           patchsize=(50, 28), framevisible=false,
+           tellwidth=false, rowgap=10, colgap=22)
+
+    p21_output = joinpath(OUTPUT_DIR, "aletsch_p21_all_models_cross_section.png")
+    save(p21_output, p21_fig; px_per_unit=1.5)
+    println("Saved $p21_output")
 end
 
-main()
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+    main()
+end

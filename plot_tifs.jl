@@ -21,6 +21,8 @@ build_swissalti3d_mosaic(
 )
 
 consensus_thickness_path = joinpath(aletsch_data_dir, "RGI60-$Aletsch_consensus_id" * "_thickness_Farinotti2019.tif")
+# IceBoost v2.0 individual-glacier product: https://doi.org/10.5281/zenodo.17724512
+iceboost_path = joinpath(aletsch_data_dir, "RGI60-11.01450.tif")
 glate_only_bedrock_path = joinpath(aletsch_data_dir, "$Aletsch_sgi_id" * "_bed_glateonly_grab2021.asc")
 grab2021_bedrock_path = joinpath(aletsch_data_dir, "$Aletsch_sgi_id" * "_GlacierBed_Grab2021.tif")
 frank2026_bedrock_path = joinpath(aletsch_data_dir, "RGI60-$Aletsch_Frank_id" * "_bedrock_franck2026.tif")
@@ -52,11 +54,21 @@ milan2022_aletsch_thickness_path = joinpath(aletsch_data_dir, "THICKNESS_RGI-11_
 milan2022_aletsch_plot_path = joinpath(aletsch_data_dir, "THICKNESS_RGI-11_2021July09_on_grab2021_grid.tif")
 _warp_raster_to_match(milan2022_aletsch_thickness_path, grab2021_thickness_path, milan2022_aletsch_plot_path; method="bilinear")
 
+iceboost_plot_path = joinpath(aletsch_data_dir, "RGI60-11.01450_thickness_IceBoostv2_on_grab2021_grid.tif")
+_warp_raster_to_match(
+    iceboost_path,
+    grab2021_thickness_path,
+    iceboost_plot_path;
+    method="bilinear",
+    source_band=1,
+)
+
 thickness_paths = [
     consensus_thickness_path,
     milan2022_aletsch_plot_path,
     grab2021_thickness_path,
     frank2026_plot_path,
+    iceboost_plot_path,
 ]
 
 labels = [
@@ -64,6 +76,7 @@ labels = [
     "Milan 2022 (surf. ~2010-2020)",
     "Grab 2021 (surf. 2023)",
     "Frank 2026 (surf. 2023)",
+    "IceBoost v2.0 (surf. 2023)",
 ]
 
 output_path = joinpath(plots_dir, "aletsch_thick_overview.png")
@@ -80,6 +93,20 @@ bedrock_difference_raster(grab2021_bedrock_path, frank2026_bedrock_plot_path, be
 bedrock_output_path = joinpath(plots_dir, "aletsch_bedrock_difference.png")
 plot_aletsch_bedrock_difference(bedrock_difference_path; output_path=bedrock_output_path, outline_path=grab2021_thickness_path)
 println("Saved figure to: ", bedrock_output_path)
+
+# Plot distributed ice-thickness difference: Grab 2021 minus IceBoost v2.0.
+iceboost_difference_path = joinpath(aletsch_data_dir, "B36-26_thickness_difference_grab2021_minus_iceboostv2.tif")
+bedrock_difference_raster(grab2021_thickness_path, iceboost_plot_path, iceboost_difference_path; force=true)
+
+iceboost_difference_output_path = joinpath(plots_dir, "aletsch_thickness_difference_grab2021_minus_iceboostv2.png")
+plot_aletsch_bedrock_difference(
+    iceboost_difference_path;
+    output_path=iceboost_difference_output_path,
+    outline_path=grab2021_thickness_path,
+    title="Grab 2021 - IceBoost v2.0",
+    colorbar_label="Ice-thickness difference (m)",
+)
+println("Saved figure to: ", iceboost_difference_output_path)
 
 
 

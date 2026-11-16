@@ -117,7 +117,7 @@ function thickness_from_surface_and_bedrock(surface_path, bedrock_path, output_p
     return output_path
 end
 
-function _warp_raster_to_match(source_path, target_path, output_path; method="bilinear")
+function _warp_raster_to_match(source_path, target_path, output_path; method="bilinear", source_band=nothing)
     ArchGDAL.read(target_path) do target
         width = ArchGDAL.width(target)
         height = ArchGDAL.height(target)
@@ -138,6 +138,7 @@ function _warp_raster_to_match(source_path, target_path, output_path; method="bi
                 "-r", method,
                 "-of", "GTiff",
             ]
+            source_band !== nothing && append!(options, ["-b", string(source_band)])
 
             warped = ArchGDAL.unsafe_gdalwarp([source], options; dest=output_path)
             ArchGDAL.destroy(warped)
@@ -821,13 +822,15 @@ function plot_aletsch_bedrock_difference(
     difference_path;
     output_path="output/plots/aletsch_bedrock_difference.png",
     outline_path=nothing,
+    title="Grab 2021 - Frank 2026",
+    colorbar_label="Bedrock difference (m)",
     colormap=cgrad([:white, :mistyrose, :red2, :darkred]),
 )
     raster = Raster(difference_path)
     colorrange = _finite_raster_range(raster)
 
     fig = Figure(size=(620, 520))
-    ax = Axis(fig[1, 1], title="Grab 2021 - Frank 2026", aspect=DataAspect())
+    ax = Axis(fig[1, 1], title=title, aspect=DataAspect())
     hm = heatmap!(ax, raster; colormap, colorrange)
     tightlimits!(ax)
 
@@ -840,7 +843,7 @@ function plot_aletsch_bedrock_difference(
         end
     end
 
-    Colorbar(fig[1, 2], hm; label="Bedrock difference (m)")
+    Colorbar(fig[1, 2], hm; label=colorbar_label)
     mkpath(dirname(output_path))
     save(output_path, fig)
     return fig
