@@ -94,11 +94,14 @@ end
 
 function plot_concept_cross_section(section, all_sections; depth_scale=1.3,
                                     gravity_index=1, comparison_section=nothing, frank_raster=nothing, uncertainty_minus=nothing,
-                                    uncertainty_plus=nothing, output_path)
+                                    uncertainty_plus=nothing, map_first=false, output_path)
     base_fit = fit_grab_gap(section; b=2.0)
     deep_fit = scale_fit_depth(section, base_fit, depth_scale)
     fig = Figure(size=(4800, 2600), figure_padding=100)
-    ax = Axis(fig[1, 1], title="$(profile_short_label(section)) cross-section",
+    main_column = map_first && comparison_section !== nothing ? 3 : 1
+    comparison_column = 2
+    map_column = map_first ? 1 : (comparison_section === nothing ? 2 : 3)
+    ax = Axis(fig[1, main_column], title="$(profile_short_label(section)) cross-section",
               xlabel="Distance (m)", ylabel="Elevation (m)",
               titlesize=56, xlabelsize=88, ylabelsize=88,
               xticklabelsize=88, yticklabelsize=88, yticks=1600:200:2800)
@@ -122,9 +125,8 @@ function plot_concept_cross_section(section, all_sections; depth_scale=1.3,
     surface_maximum = maximum(filter(isfinite, section.surface))
     ylims!(ax, 1800, surface_maximum + 40)
 
-    map_column = 2
     if comparison_section !== nothing
-        comparison_ax = Axis(fig[1, 2],
+        comparison_ax = Axis(fig[1, comparison_column],
             title=profile_short_label(comparison_section) * " cross-section",
             xlabel="Distance (m)", ylabel="Elevation (m)",
             titlesize=56, xlabelsize=88, ylabelsize=88,
@@ -158,7 +160,6 @@ function plot_concept_cross_section(section, all_sections; depth_scale=1.3,
         xlims!(comparison_ax, 0, maximum(comparison_section.distance))
         comparison_surface_maximum = maximum(filter(isfinite, comparison_section.surface))
         ylims!(comparison_ax, comparison_minimum - 40, comparison_surface_maximum + 40)
-        map_column = 3
     end
 
     plot_concept_location_map!(fig[1, map_column], section, all_sections;

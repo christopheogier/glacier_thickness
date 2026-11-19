@@ -21,6 +21,17 @@ function main()
                                uncertainty_plus=uncertainty_plus,
                                output_path=output)
     println("Saved $output")
+
+    focused_output = joinpath(OUTPUT_DIR, "aletsch_p17_p21_concept.png")
+    plot_concept_cross_section(section, [section, comparison_section];
+                               depth_scale=DEPTH_SCALE,
+                               gravity_index=1,
+                               comparison_section=comparison_section,
+                               uncertainty_minus=uncertainty_minus,
+                               uncertainty_plus=uncertainty_plus,
+                               map_first=true,
+                               output_path=focused_output)
+    println("Saved $focused_output")
 end
 
 if abspath(PROGRAM_FILE) == abspath(@__FILE__)
